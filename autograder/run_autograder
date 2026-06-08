@@ -1,0 +1,25 @@
+#!/bin/bash
+
+# Create directories
+mkdir -p /autograder/working
+mkdir -p /autograder/results
+
+# Copy student submission
+if [ -d "/autograder/submission" ]; then
+    cp -r /autograder/submission/* /autograder/working/
+fi
+
+cd /autograder/working
+
+# Run the grading script
+# stdout (JSON) goes to results.json
+# stderr (debug) goes to Gradescope's autograder output
+python3 /autograder/source/run_tests.py > /autograder/results/results.json
+
+# Verify we have valid JSON
+if [ ! -s /autograder/results/results.json ]; then
+    echo '{"score": 0, "output": "Error: No output from autograder", "tests": []}' > /autograder/results/results.json
+fi
+
+# Output the JSON (this is what Gradescope expects)
+cat /autograder/results/results.json
