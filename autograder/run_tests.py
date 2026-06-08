@@ -142,25 +142,68 @@ def fix_puppeteer_config(submission_path):
         
         if "scripts" not in pkg:
             pkg["scripts"] = {}
-        pkg["scripts"]["test"] = "jest --forceExit --maxWorkers=1"
+        pkg["scripts"]["test"] = "jest --forceExit --maxWorkers=1 --json --outputFile=test-results.json"
         
         with open(package_path, 'w') as f:
             json.dump(pkg, f, indent=2)
         debug("Updated package.json")
 
-def parse_test_results(output):
-    results = {"passed": 0, "failed": 0, "total": 0}
+def parse_individual_test_results(submission_path):
+    """Parse the Jest JSON output file to get individual test results"""
+    results_file = Path(submission_path) / "test-results.json"
+    test_cases = []
     
-    # Look for test results
+    if results_file.exists():
+        try:
+            with open(results_file, 'r') as f:
+                data = json.load(f)
+            
+            # Navigate through Jest's JSON structure
+            if 'testResults' in data:
+                for test_result in data['testResults']:
+                    if 'assertionResults' in test_result:
+                        for assertion in test_result['assertionResults']:
+                            test_name = assertion.get('title', 'Unknown test')
+                            status = assertion.get('status', 'failed')
+                            test_cases.append({
+                                'name': test_name,
+                                'status': status,
+                                'duration': assertion.get('duration', 0)
+                            })
+        except Exception as e:
+            debug(f"Error parsing test results JSON: {e}")
+    
+    return test_cases
+
+def parse_test_results(output, submission_path):
+    results = {"passed": 0, "failed": 0, "total": 0, "test_cases": []}
+    
+    # First try to get individual test cases from JSON output
+    json_test_cases = parse_individual_test_results(submission_path)
+    if json_test_cases:
+        results["test_cases"] = json_test_cases
+        for test in json_test_cases:
+            results["total"] += 1
+            if test['status'] == 'passed':
+                results["passed"] += 1
+            else:
+                results["failed"] += 1
+        return results
+    
+    # Fallback to parsing stdout if JSON not available
     test_pattern = r'(PASS|FAIL|✓|✕)\s+(.+?)\s+\((\d+)\s+ms\)'
     for line in output.split('\n'):
         match = re.match(test_pattern, line)
         if match:
+            status = match.group(1)
+            test_name = match.group(2)
             results["total"] += 1
-            if match.group(1) == 'PASS' or match.group(1) == '✓':
+            if status == 'PASS' or status == '✓':
                 results["passed"] += 1
+                results["test_cases"].append({'name': test_name, 'status': 'passed'})
             else:
                 results["failed"] += 1
+                results["test_cases"].append({'name': test_name, 'status': 'failed'})
     
     # If no individual tests found, try summary
     if results["total"] == 0:
@@ -180,7 +223,6 @@ def check_screenshot(submission_path):
     found_screenshots = []
     for pattern in screenshot_patterns:
         found_screenshots.extend(Path(submission_path).glob(pattern))
-        # Also check in common locations
         for subdir in ["screenshots", "images", "assets"]:
             subdir_path = Path(submission_path) / subdir
             if subdir_path.exists():
@@ -214,33 +256,32 @@ def check_readme(submission_path):
     
     score = 0
     feedback = []
-    # Each question is worth 0.125 points (0.5 total for 4 questions)
     
     if any(kw in content for kw in ["github action", "push", "ci/cd"]):
         score += 0.125
         feedback.append("[PASS] Q1: Automated testing placement")
     else:
-        feedback.append("[FAIL] Q1: Missing")
+        feedback.append("[FAIL] Q1: Missing (Automated testing placement)")
     
     if "no" in content and ("function" in content or "unit" in content):
         score += 0.125
         feedback.append("[PASS] Q2: E2E testing purpose")
     else:
-        feedback.append("[FAIL] Q2: Missing")
+        feedback.append("[FAIL] Q2: Missing (E2E testing purpose)")
     
     if "navigation" in content and "snapshot" in content:
         score += 0.125
         feedback.append("[PASS] Q3: Lighthouse modes")
     else:
-        feedback.append("[FAIL] Q3: Missing")
+        feedback.append("[FAIL] Q3: Missing (Lighthouse modes)")
     
     keywords = ["perform", "access", "image", "load", "cache", "defer"]
     matches = sum(1 for kw in keywords if kw in content)
-    if matches >= 2:
+    if matches >= 3:
         score += 0.125
         feedback.append(f"[PASS] Q4: Lighthouse improvements (found {matches}/3)")
     else:
-        feedback.append("[FAIL] Q4: Missing")
+        feedback.append(f"[FAIL] Q4: Missing (Minimum of 3 Lighthouse improvements) (found {matches}/3)")
     
     return score, feedback
 
@@ -277,7 +318,7 @@ def main():
     else:
         run_command("npm install --prefer-offline --no-audit --no-fund", cwd=submission_path, timeout=180)
     
-    # Run tests
+    # Run tests with JSON output
     debug("Running tests...")
     env = os.environ.copy()
     env['PUPPETEER_EXECUTABLE_PATH'] = '/usr/bin/google-chrome-stable'
@@ -287,7 +328,7 @@ def main():
     debug("Tests completed")
     
     # Parse results - tests are worth 2.0 points
-    test_results = parse_test_results(stdout)
+    test_results = parse_test_results(stdout, submission_path)
     test_score = 0
     if test_results["total"] > 0:
         test_score = (test_results["passed"] / test_results["total"]) * 2.0
@@ -302,13 +343,60 @@ def main():
     final_score = test_score + readme_score + screenshot_score
     final_score = round(min(final_score, 3.0), 2)
     
-    # Build output
+    # Build individual test results for Gradescope rubric
+    tests_rubric = []
+    if test_results["test_cases"]:
+        for i, test in enumerate(test_results["test_cases"], 1):
+            test_name = test['name']
+            status = test['status']
+            # Truncate long test names
+            if len(test_name) > 60:
+                test_name = test_name[:57] + "..."
+            
+            tests_rubric.append({
+                "name": f"Test {i}: {test_name}",
+                "score": (2.0 / test_results["total"]) if status == 'passed' else 0,
+                "max_score": (2.0 / test_results["total"]),
+                "output": f"[{status.upper()}] {test['name']}"
+            })
+    else:
+        # Fallback if no individual test names found
+        tests_rubric.append({
+            "name": "E2E Tests",
+            "score": test_score,
+            "max_score": 2.0,
+            "output": f"Passed {test_results['passed']}/{test_results['total']} tests"
+        })
+    
+    # Add README questions to rubric
+    readme_rubric = [
+        {"name": "README Q1: Automated Testing Placement", "score": 0.125 if "[PASS]" in readme_feedback[0] else 0, "max_score": 0.125, "output": readme_feedback[0]},
+        {"name": "README Q2: E2E Testing Purpose", "score": 0.125 if "[PASS]" in readme_feedback[1] else 0, "max_score": 0.125, "output": readme_feedback[1]},
+        {"name": "README Q3: Lighthouse Modes", "score": 0.125 if "[PASS]" in readme_feedback[2] else 0, "max_score": 0.125, "output": readme_feedback[2]},
+        {"name": "README Q4: Lighthouse Improvements", "score": 0.125 if "[PASS]" in readme_feedback[3] else 0, "max_score": 0.125, "output": readme_feedback[3]},
+    ]
+    
+    # Add screenshot to rubric
+    screenshot_rubric = [
+        {"name": "Screenshot of Test Results", "score": screenshot_score, "max_score": 0.5, "output": screenshot_status}
+    ]
+    
+    # Combine all rubric items
+    all_rubric_items = tests_rubric + readme_rubric + screenshot_rubric
+    
+    # Build output for students
     elapsed = time.time() - start_time
     output_lines.append(f"\nTest Results (completed in {elapsed:.1f}s):")
     output_lines.append(f"  Total tests: {test_results['total']}")
     output_lines.append(f"  Passed: {test_results['passed']}")
     output_lines.append(f"  Failed: {test_results['failed']}")
     output_lines.append(f"  Test score: {test_score:.2f}/2.00")
+    
+    if test_results["test_cases"]:
+        output_lines.append("\n  Individual Tests:")
+        for test in test_results["test_cases"]:
+            status_symbol = "[PASS]" if test['status'] == 'passed' else "[FAIL]"
+            output_lines.append(f"    {status_symbol} {test['name']}")
     
     output_lines.append("\n" + "=" * 50)
     output_lines.append("README QUESTIONS (0.5 points total)")
@@ -321,7 +409,6 @@ def main():
     output_lines.append("=" * 50)
     output_lines.append(screenshot_status)
     output_lines.append(f"Screenshot score: {screenshot_score:.2f}/0.50")
-    output_lines.append("Note: Screenshot should show npm test results for lab7.test.js")
     
     output_lines.append("\n" + "=" * 50)
     output_lines.append(f"FINAL SCORE: {final_score:.2f}/3.00")
@@ -332,11 +419,11 @@ def main():
         server_process.terminate()
         debug("Server stopped")
     
-    # Output JSON
+    # Output JSON with rubric items
     result = {
         "score": final_score,
         "output": "\n".join(output_lines),
-        "tests": []
+        "tests": all_rubric_items
     }
     print(json.dumps(result))
 
